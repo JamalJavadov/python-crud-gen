@@ -250,6 +250,7 @@ class App(ttk.Frame):
         self.log = tk.Text(bottom, height=12, wrap="none")
         self.log.pack(fill="both", expand=True)
         self.log.configure(state="disabled")
+        self._configure_log_tags()
 
         yscroll = ttk.Scrollbar(self.log, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=yscroll.set)
@@ -393,7 +394,7 @@ class App(ttk.Frame):
                 kind, payload = self.q.get_nowait()
                 if kind == "log":
                     self.log.configure(state="normal")
-                    self.log.insert("end", payload + "\n")
+                    self._insert_log_line(payload)
                     self.log.see("end")
                     self.log.configure(state="disabled")
                 elif kind == "preview":
@@ -402,6 +403,27 @@ class App(ttk.Frame):
         except queue.Empty:
             pass
         self.after(90, self._poll_queue)
+
+    def _configure_log_tags(self) -> None:
+        self.log.tag_configure("INFO", foreground="#1f6feb")
+        self.log.tag_configure("RUN", foreground="#8250df")
+        self.log.tag_configure("CMD", foreground="#8b949e")
+        self.log.tag_configure("DONE", foreground="#2da44e")
+        self.log.tag_configure("OK", foreground="#2da44e")
+        self.log.tag_configure("WARN", foreground="#d29922")
+        self.log.tag_configure("STOP", foreground="#d29922")
+        self.log.tag_configure("ERROR", foreground="#f85149")
+
+    def _insert_log_line(self, line: str) -> None:
+        tag = None
+        if line.startswith("[") and "]" in line:
+            label = line[1:line.index("]")]
+            if self.log.tag_cget(label, "foreground"):
+                tag = label
+        if tag:
+            self.log.insert("end", line + "\n", (tag,))
+        else:
+            self.log.insert("end", line + "\n")
 
     # -------------- pickers --------------
 

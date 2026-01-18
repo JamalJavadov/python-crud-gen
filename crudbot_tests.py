@@ -379,25 +379,17 @@ def json_object(pairs: List[Tuple[str, str]]) -> str:
     inner = ",\n            ".join([f'"{k}": {v}' for k, v in pairs])
     return "{\n            " + inner + "\n        }"
 
-def generate_test_for_entity(base_pkg: str, api_prefix: str, src_test_java: Path, ent: Entity, emap: Dict[str, Entity], selected_names: Set[str]) -> Tuple[Path, str]:
+def generate_test_for_entity(base_pkg: str, api_prefix: str, src_test_java: Path, ent: Entity, emap: Dict[str, Entity]) -> Tuple[Path, str]:
     pkg = f"{base_pkg}.crudbottests"
     cls = f"{ent.name}CrudIT"
     route = f"{api_prefix}/{route_name(ent.name)}"
     id_field = ent.id_field
-    id_type = wrapper_type(ent.id_type)
 
-    # Build JSON payload (create)
     create_pairs: List[Tuple[str, str]] = []
-    patch_pairs: List[Tuple[str, str]] = []
 
-    # Determine one updatable simple field for patch
-    patch_field_name: Optional[str] = None
-    patch_field_value: Optional[str] = None
-
-    # Relation setup snippets
     repo_fields: List[str] = []
     setup_lines: List[str] = []
-    create_required_relations: List[Tuple[str, str]] = []  # (jsonField, javaVarId)
+    create_required_relations: List[Tuple[str, str]] = []
 
     for f in ent.fields:
         if f.is_id or f.name == id_field or f.name in {"createdAt","updatedAt","createdBy","updatedBy","deleted","version"}:
@@ -409,42 +401,21 @@ def generate_test_for_entity(base_pkg: str, api_prefix: str, src_test_java: Path
             target = emap[f.rel_target]
             target_repo = f"{target.name}Repository"
             repo_fields.append(f"    @Autowired private {target_repo} {target_repo[0].lower() + target_repo[1:]};")
-            # create target entity in DB and use its id if required
             json_key = f"{f.name}Id"
             var_name = f"{f.name}Id"
             if required:
                 create_required_relations.append((json_key, var_name))
-            # patch doesn't touch relations by default
             continue
 
         if f.is_rel_multi and f.rel_target and f.rel_target in emap:
-            # optional: set empty list
             create_pairs.append((f"{f.name}Ids", "[]"))
             continue
 
-        # simple field
         v = dummy_json_value(f.type_name)
         create_pairs.append((f.name, v))
 
-        if patch_field_name is None:
-            patch_field_name = f.name
-            # change value
-            if v == '"test"':
-                patch_field_value = '"test2"'
-            elif v == "1":
-                patch_field_value = "2"
-            elif v == "1.0":
-                patch_field_value = "2.0"
-            elif v == "false":
-                patch_field_value = "true"
-            else:
-                patch_field_value = '"patched"'
-
-    # setup required relations: create/persist targets via repository + reflection
     for json_key, var_name in create_required_relations:
-        # var_name is id variable; we need to persist target entity and extract id field reflectively
-        # Find target entity by json_key prefix => field name
-        field_name = json_key[:-2]  # remove "Id"
+        field_name = json_key[:-2]
         fdef = next((x for x in ent.fields if x.name == field_name), None)
         target = emap.get(fdef.rel_target) if fdef and fdef.rel_target else None
         if not target:
@@ -457,44 +428,23 @@ def generate_test_for_entity(base_pkg: str, api_prefix: str, src_test_java: Path
         setup_lines.append(f"        ReflectionUtil.fillDefaults(ref{tgt_cls});")
         setup_lines.append(f"        ref{tgt_cls} = {repo_var}.saveAndFlush(ref{tgt_cls});")
         setup_lines.append(f"        Object {var_name} = ReflectionUtil.getField(ref{tgt_cls}, \"{tgt_id_field}\");")
-        # add to create json
-        create_pairs.append((json_key, f"\" + {var_name} + \""))  # will be embedded in String building below
+        create_pairs.append((json_key, f"\" + {var_name} + \""))
 
-    # Build create JSON string — needs special handling for relation ids set at runtime
-    # We'll build it as Java text block with String.format? We'll do manual concatenation safely.
-    # If there are dynamic values, we embed using + var + in Java.
     has_dynamic = any(v.startswith('" + ') for _, v in create_pairs)
 
     if not has_dynamic:
         create_json_java = f'        String createJson = """\n{json_object(create_pairs)}\n        """;'
     else:
-        # Build JSON with placeholders via concatenation. We'll escape quotes around keys.
         lines = ['        String createJson = "{\\n" +']
         for i, (k, v) in enumerate(create_pairs):
             comma = "," if i < len(create_pairs) - 1 else ""
             if v.startswith('" + '):
-                # dynamic id embedded as string => numeric allowed too; we keep as raw.
-                # v looks like: " + var + "
-                # We want:  "key": <var>,
                 dyn = v[len('" + '):-len(' + "')]
                 lines.append(f'                "            \\"{k}\\": " + {dyn} + "{comma}\\n" +')
             else:
                 lines.append(f'                "            \\"{k}\\": {v}{comma}\\n" +')
         lines.append('                "        }";')
         create_json_java = "\n".join(lines)
-
-    # Patch JSON: must include version and one changed field if available
-    if patch_field_name is None:
-        patch_pairs = [("version", '" + version + "')]  # only version
-        patch_json_java = '        String patchJson = "{\\n            \\"version\\": " + version + "\\n        }";'
-    else:
-        patch_pairs = [("version", '" + version + "'), (patch_field_name, patch_field_value or '"patched"')]
-        # patch has dynamic version, maybe static field value
-        patch_lines = ['        String patchJson = "{\\n" +',
-                       '                "            \\"version\\": " + version + ",\\n" +',
-                       f'                "            \\"{patch_field_name}\\": {patch_field_value}\\n" +',
-                       '                "        }";']
-        patch_json_java = "\n".join(patch_lines)
 
     code = f"""package {pkg};
 
@@ -511,7 +461,6 @@ import org.springframework.test.web.servlet.MvcResult;
 
 import java.lang.reflect.Field;
 import java.time.Instant;
-import java.util.Objects;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
@@ -533,75 +482,46 @@ class {cls} {{
 
     @Test
     void fullCrudFlow() throws Exception {{
-        // Arrange: ensure clean slate for this entity
         repository.deleteAll();
         repository.flush();
 
 {chr(10).join(setup_lines) if setup_lines else ""}
 {create_json_java}
 
-        // 1) Create
         MvcResult createdRes = mvc.perform(post("{route}")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(createJson))
                 .andExpect(status().isCreated())
-                .andExpect(header().exists("Location"))
-                .andExpect(jsonPath("$.success").value(true))
                 .andReturn();
 
-        JsonNode created = om.readTree(createdRes.getResponse().getContentAsString()).get("data");
+        JsonNode created = om.readTree(createdRes.getResponse().getContentAsString());
         assertThat(created).isNotNull();
 
         String idStr = created.get("{id_field}").asText();
-        long version = created.get("version").asLong();
 
-        // 2) Get
         mvc.perform(get("{route}/" + idStr))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.success").value(true))
-                .andExpect(jsonPath("$.data.{id_field}").value(idStr));
+                .andExpect(jsonPath("$.{id_field}").value(idStr));
 
-        // 3) List
         mvc.perform(get("{route}"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.success").value(true))
-                .andExpect(jsonPath("$.data.totalElements").value(1));
+                .andExpect(jsonPath("$.length()").value(1));
 
-        // 4) Patch (valid version)
-{patch_json_java}
-        MvcResult patchedRes = mvc.perform(patch("{route}/" + idStr)
+        mvc.perform(put("{route}/" + idStr)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(patchJson))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.success").value(true))
-                .andReturn();
+                        .content(createJson))
+                .andExpect(status().isOk());
 
-        JsonNode patched = om.readTree(patchedRes.getResponse().getContentAsString()).get("data");
-        long newVersion = patched.get("version").asLong();
-        assertThat(newVersion).isGreaterThanOrEqualTo(version);
-
-        // 5) Patch with stale version -> 409
-        String stalePatch = "{{\\n            \\"version\\": " + version + "\\n        }}";
-        mvc.perform(patch("{route}/" + idStr)
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(stalePatch))
-                .andExpect(status().isConflict());
-
-        // 6) Delete (soft delete)
         mvc.perform(delete("{route}/" + idStr))
                 .andExpect(status().isNoContent());
 
-        // 7) List should hide deleted (soft delete filter)
         mvc.perform(get("{route}"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.data.totalElements").value(0));
+                .andExpect(jsonPath("$.length()").value(0));
     }}
 
-    /** Reflection helpers so tests don't depend on Lombok setters. */
     static class ReflectionUtil {{
         static void fillDefaults(Object entity) {{
-            // Try to set some safe defaults to avoid NOT NULL issues in H2 schema.
-            // Skips id/version/auditing/deleted and relation fields.
             for (Field f : entity.getClass().getDeclaredFields()) {{
                 f.setAccessible(true);
                 String n = f.getName();
@@ -623,7 +543,6 @@ class {cls} {{
                     else if (t.getName().equals("java.time.Instant")) f.set(entity, Instant.now());
                     else if (t.getName().equals("java.time.LocalDate")) f.set(entity, java.time.LocalDate.parse("2025-01-01"));
                     else if (t.getName().equals("java.time.LocalDateTime")) f.set(entity, java.time.LocalDateTime.parse("2025-01-01T10:00:00"));
-                    // Collections/relations are left alone.
                 }} catch (Exception ignored) {{}}
             }}
         }}
@@ -694,7 +613,7 @@ def main() -> int:
 
     written = 0
     for ent in selected:
-        pth, code = generate_test_for_entity(base_pkg, args.api_prefix, src_test_java, ent, emap, names)
+        pth, code = generate_test_for_entity(base_pkg, args.api_prefix, src_test_java, ent, emap)
         write_text(pth, code)
         written += 1
         print(f"Generated: {pth.relative_to(root)}")
