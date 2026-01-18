@@ -23,6 +23,15 @@ pip install javalang rich
 python3 crudbot_app.py
 ```
 
+## Run unified CLI interface
+
+```bash
+python3 crudbot_interface.py crud --root /path/to/project
+python3 crudbot_interface.py tests --root /path/to/project
+python3 crudbot_interface.py analyze --root /path/to/project
+python3 crudbot_interface.py all --root /path/to/project --generate-tests --run-analyzer
+```
+
 ## Workflow
 
 1. Select your **Spring Boot project root**

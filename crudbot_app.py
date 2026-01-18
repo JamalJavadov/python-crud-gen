@@ -25,11 +25,13 @@ import threading
 import queue
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 # --- UI (tkinter) ---
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+from crudbot import AnalyzerBotConfig, CrudBotConfig, CrudBotHub, TestBotConfig
 
 # --- optional deps for entity scanning ---
 try:
@@ -163,22 +165,6 @@ def detect_base_package(root: Path) -> str:
         return "com.example"
     return sorted(freq.items(), key=lambda x: x[1], reverse=True)[0][0]
 
-def run_stream(cmd: List[str], cwd: Optional[Path], on_line) -> int:
-    """Run command and stream stdout+stderr lines to callback."""
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1
-    )
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        on_line(line.rstrip("\n"))
-    proc.wait()
-    return int(proc.returncode or 0)
-
 class App(ttk.Frame):
     def __init__(self, master: tk.Tk):
         super().__init__(master)
@@ -187,6 +173,7 @@ class App(ttk.Frame):
         self.master.minsize(980, 680)
 
         self.q: "queue.Queue[Tuple[str,str]]" = queue.Queue()
+        self.hub = CrudBotHub()
 
         # --- state ---
         self.project_root = tk.StringVar()
@@ -263,6 +250,7 @@ class App(ttk.Frame):
         self.log = tk.Text(bottom, height=12, wrap="none")
         self.log.pack(fill="both", expand=True)
         self.log.configure(state="disabled")
+        self._configure_log_tags()
 
         yscroll = ttk.Scrollbar(self.log, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=yscroll.set)
@@ -406,7 +394,7 @@ class App(ttk.Frame):
                 kind, payload = self.q.get_nowait()
                 if kind == "log":
                     self.log.configure(state="normal")
-                    self.log.insert("end", payload + "\n")
+                    self._insert_log_line(payload)
                     self.log.see("end")
                     self.log.configure(state="disabled")
                 elif kind == "preview":
@@ -415,6 +403,27 @@ class App(ttk.Frame):
         except queue.Empty:
             pass
         self.after(90, self._poll_queue)
+
+    def _configure_log_tags(self) -> None:
+        self.log.tag_configure("INFO", foreground="#1f6feb")
+        self.log.tag_configure("RUN", foreground="#8250df")
+        self.log.tag_configure("CMD", foreground="#8b949e")
+        self.log.tag_configure("DONE", foreground="#2da44e")
+        self.log.tag_configure("OK", foreground="#2da44e")
+        self.log.tag_configure("WARN", foreground="#d29922")
+        self.log.tag_configure("STOP", foreground="#d29922")
+        self.log.tag_configure("ERROR", foreground="#f85149")
+
+    def _insert_log_line(self, line: str) -> None:
+        tag = None
+        if line.startswith("[") and "]" in line:
+            label = line[1:line.index("]")]
+            if self.log.tag_cget(label, "foreground"):
+                tag = label
+        if tag:
+            self.log.insert("end", line + "\n", (tag,))
+        else:
+            self.log.insert("end", line + "\n")
 
     # -------------- pickers --------------
 
@@ -492,41 +501,28 @@ class App(ttk.Frame):
                 pass
         return names
 
-    def _build_crud_cmd(self, *, entities: List[str]) -> Tuple[List[str], Path]:
+    def _build_crud_config(self, *, entities: List[str]) -> CrudBotConfig:
         root = Path(strip_quotes(self.project_root.get()))
         gen = Path(strip_quotes(self.generator_path.get()))
         if not gen.exists():
             raise RuntimeError("CRUD generator file not found. Select java-project-crud.py")
         if not root.exists():
             raise RuntimeError("Project root not found.")
-        cmd: List[str] = [sys.executable, str(gen), "--root", str(root)]
-        if entities:
-            cmd += ["--entities", ",".join(entities)]
-        else:
-            cmd += ["--all"]
-
-        if self.api_prefix.get().strip():
-            cmd += ["--api-prefix", self.api_prefix.get().strip()]
-
-        cmd += ["--backup-mode", self.backup_mode.get()]
-        cmd += ["--overwrite-policy", self.overwrite_policy.get()]
-
-        if self.dry_run.get():
-            cmd += ["--dry-run"]
-        if self.no_build.get():
-            cmd += ["--no-build"]
-        if self.no_config.get():
-            cmd += ["--no-config"]
-        if self.no_docker.get():
-            cmd += ["--no-docker"]
-        if self.no_openapi.get():
-            cmd += ["--no-openapi"]
-        if self.no_compile.get():
-            cmd += ["--no-compile"]
-        if self.patch_all.get():
-            cmd += ["--patch-all"]
-
-        return cmd, root
+        return CrudBotConfig(
+            project_root=root,
+            generator_path=gen,
+            entities=entities,
+            api_prefix=self.api_prefix.get().strip(),
+            backup_mode=self.backup_mode.get(),
+            overwrite_policy=self.overwrite_policy.get(),
+            patch_all=self.patch_all.get(),
+            dry_run=self.dry_run.get(),
+            no_build=self.no_build.get(),
+            no_config=self.no_config.get(),
+            no_docker=self.no_docker.get(),
+            no_openapi=self.no_openapi.get(),
+            no_compile=self.no_compile.get(),
+        )
 
     def _run_crud(self) -> None:
         root = Path(strip_quotes(self.project_root.get() or ""))
@@ -542,9 +538,8 @@ class App(ttk.Frame):
             try:
                 self._log("=" * 80)
                 self._log("[RUN] CRUD generator")
-                cmd, cwd = self._build_crud_cmd(entities=entities)
-                self._log("[CMD] " + " ".join(cmd))
-                rc = run_stream(cmd, cwd=cwd, on_line=self._log)
+                config = self._build_crud_config(entities=entities)
+                rc = self.hub.run_crud(config, on_line=self._log)
                 self._log(f"[DONE] CRUD generator exit code: {rc}")
 
                 if rc != 0:
@@ -554,7 +549,7 @@ class App(ttk.Frame):
                 if self.gen_tests.get():
                     self._log("")
                     self._log("[RUN] Test generator")
-                    rc2 = self._run_tests_generator(root, entities)
+                    rc2 = self.hub.run_tests(TestBotConfig(project_root=root, entities=entities), on_line=self._log)
                     self._log(f"[DONE] Test generator exit code: {rc2}")
 
                     if rc2 != 0:
@@ -564,7 +559,7 @@ class App(ttk.Frame):
                 if self.run_tests.get():
                     self._log("")
                     self._log("[RUN] mvn/gradle test")
-                    rc3 = self._run_build_tests(root)
+                    rc3 = self.hub.run_build_tests(root, on_line=self._log)
                     self._log(f"[DONE] test task exit code: {rc3}")
 
             except Exception as e:
@@ -584,55 +579,18 @@ class App(ttk.Frame):
             try:
                 self._log("=" * 80)
                 self._log("[RUN] Test generator (only)")
-                rc2 = self._run_tests_generator(root, entities)
+                rc2 = self.hub.run_tests(TestBotConfig(project_root=root, entities=entities), on_line=self._log)
                 self._log(f"[DONE] Test generator exit code: {rc2}")
                 if self.run_tests.get() and rc2 == 0:
                     self._log("")
                     self._log("[RUN] mvn/gradle test")
-                    rc3 = self._run_build_tests(root)
+                    rc3 = self.hub.run_build_tests(root, on_line=self._log)
                     self._log(f"[DONE] test task exit code: {rc3}")
             except Exception as e:
                 self._log(f"[ERROR] {e}")
                 messagebox.showerror("Run failed", str(e))
 
         threading.Thread(target=work, daemon=True).start()
-
-    def _run_tests_generator(self, project_root: Path, entities: List[str]) -> int:
-        # crudbot_tests.py is shipped with this UI (same folder)
-        tests_py = Path(__file__).with_name("crudbot_tests.py")
-        if not tests_py.exists():
-            raise RuntimeError("crudbot_tests.py not found рядом with UI.")
-
-        cmd: List[str] = [sys.executable, str(tests_py), "--root", str(project_root)]
-        if entities:
-            cmd += ["--entities", ",".join(entities)]
-        else:
-            cmd += ["--all"]
-        self._log("[CMD] " + " ".join(cmd))
-        return run_stream(cmd, cwd=project_root, on_line=self._log)
-
-    def _run_build_tests(self, project_root: Path) -> int:
-        # Try Maven wrapper, then Gradle wrapper, then system binaries.
-        cwd = project_root
-        # if project uses multi-module, wrappers are usually at root; we just run at project_root
-        if (cwd / "mvnw").exists() and not is_windows():
-            cmd = ["./mvnw", "-q", "test"]
-        elif (cwd / "mvnw.cmd").exists() and is_windows():
-            cmd = ["cmd", "/c", "mvnw.cmd", "-q", "test"]
-        elif (cwd / "gradlew").exists() and not is_windows():
-            cmd = ["./gradlew", "-q", "test"]
-        elif (cwd / "gradlew.bat").exists() and is_windows():
-            cmd = ["cmd", "/c", "gradlew.bat", "-q", "test"]
-        elif shutil_which("mvn"):
-            cmd = ["mvn", "-q", "test"]
-        elif shutil_which("gradle"):
-            cmd = ["gradle", "-q", "test"]
-        else:
-            self._log("[WARN] No mvn/gradle found; skipping test run.")
-            return 0
-
-        self._log("[CMD] " + " ".join(cmd))
-        return run_stream(cmd, cwd=cwd, on_line=self._log)
 
     # -------------- actions: Analyzer --------------
 
@@ -662,41 +620,21 @@ class App(ttk.Frame):
                 self._log(f"[INFO] Root: {root}")
                 self._log(f"[INFO] Report: {out_path}")
                 self._log(f"[INFO] Context: {ctx_path}")
-                # Import analyzer module (shipped in this zip)
-                import importlib
-                analyzer = importlib.import_module("crudbot_analyzer")
-
-                exclude_dirs = set(getattr(analyzer, "DEFAULT_EXCLUDE_DIRS", [])) | set(extra_excl)
-
-                scan = analyzer.scan_project(
-                    root=root,
-                    exclude_dirs=exclude_dirs,
-                    max_file_bytes=max_bytes,
-                    include_all_text=include_all
-                )
-
-                report_parts = [
-                    analyzer.make_overview(scan),
-                    analyzer.make_structure_section(scan),
-                    analyzer.make_build_section(scan),
-                    analyzer.make_packages_section(scan),
-                    analyzer.make_files_section(scan),
-                ]
-                report = "\n\n".join(report_parts).rstrip() + "\n"
-                analyzer.safe_write(out_path, report)
-
-                ctx_txt = analyzer.make_ai_context(scan).rstrip() + "\n"
-                analyzer.safe_write(ctx_path, ctx_txt)
+                report = self.hub.run_analyzer(AnalyzerBotConfig(
+                    project_root=root,
+                    report_path=out_path,
+                    context_path=ctx_path,
+                    max_file_kb=int(self.max_file_kb.get()),
+                    include_all_text=include_all,
+                    exclude_dirs_extra=extra_excl,
+                ))
 
                 self._log("[DONE] Analyzer complete.")
                 self._log(f"[DONE] Report:  {out_path.resolve()}")
                 self._log(f"[DONE] Context: {ctx_path.resolve()}")
 
                 # preview (first 200KB for UI)
-                try:
-                    prev = report if len(report) <= 200_000 else report[:200_000] + "\n\n...(truncated in UI preview)\n"
-                except Exception:
-                    prev = "Preview unavailable."
+                prev = report if len(report) <= 200_000 else report[:200_000] + "\n\n...(truncated in UI preview)\n"
                 self._set_preview(prev)
 
             except Exception as e:
@@ -731,13 +669,6 @@ class App(ttk.Frame):
             self._log("[OK] Context copied to clipboard.")
         except Exception as e:
             messagebox.showwarning("Copy failed", str(e))
-
-
-def shutil_which(name: str) -> Optional[str]:
-    # small wrapper to avoid importing shutil in global scope (faster cold start)
-    import shutil
-    return shutil.which(name)
-
 def main() -> int:
     root = tk.Tk()
     # nicer spacing on mac/win
