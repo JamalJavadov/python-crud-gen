@@ -2147,7 +2147,7 @@ def gen_service(proj: Project, ent: Entity, emap: Dict[str, Entity]) -> Tuple[Pa
             getter = f"dto.get{camel(f.name)}Ids()"
             resolve_create.append(f"""
         if ({getter} != null) {{
-            var ids = {getter};
+            var ids = new LinkedHashSet<>({getter});
             var refs = {lower_first(target_repo)}.findAllById(ids);
             if (refs.size() != ids.size()) {{
                 throw new {target.name}NotFound("Some IDs not found: " + ids);
@@ -2156,7 +2156,7 @@ def gen_service(proj: Project, ent: Entity, emap: Dict[str, Entity]) -> Tuple[Pa
         }}""")
             resolve_update.append(f"""
         if ({getter} != null) {{
-            var ids = {getter};
+            var ids = new LinkedHashSet<>({getter});
             var refs = {lower_first(target_repo)}.findAllById(ids);
             if (refs.size() != ids.size()) {{
                 throw new {target.name}NotFound("Some IDs not found: " + ids);
@@ -2167,7 +2167,7 @@ def gen_service(proj: Project, ent: Entity, emap: Dict[str, Entity]) -> Tuple[Pa
         }}""")
             resolve_patch.append(f"""
         if ({getter} != null) {{
-            var ids = {getter};
+            var ids = new LinkedHashSet<>({getter});
             var refs = {lower_first(target_repo)}.findAllById(ids);
             if (refs.size() != ids.size()) {{
                 throw new {target.name}NotFound("Some IDs not found: " + ids);
